@@ -1,0 +1,36 @@
+# Python缓存
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# 虚拟环境
+venv/
+env/
+.venv/
+ENV/
+
+# VSCode设置
+.vscode/
+
+# 单元测试缓存
+.pytest_cache/
+.tox/
+
+# 构建输出
+build/
+dist/
+*.egg-info/
+
+# 忽略所有版本文件夹下的build和dist
+version_*/build/
+version_*/dist/
+
+# 临时文件
+*.log
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db
