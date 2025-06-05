@@ -13,6 +13,10 @@ from sklearn.metrics import mean_squared_error
 import numpy as np
 import sys
 import traceback
+import scipy.stats as stats
+import statsmodels.api as sm
+import statsmodels.stats.stattools as smtools
+import seaborn as sns
 
 PLOT_TYPE_META = {
     "折线图":    {"needs_y": True,  "needs_x_numeric_or_date": True,  "predictable": True,  "desc": "连续型/时序数据"},
@@ -324,20 +328,35 @@ class TimeSeriesPredictorApp:
         self.poly_spin = tk.Spinbox(param_btn_frame, from_=2, to=8, textvariable=self.poly_degree, width=4, font=('Microsoft YaHei', 11), state='readonly')
         self.poly_spin.grid(row=0, column=7, padx=(0, 8))
 
+        # === 相关性分析控件 ===
+        self.corr_mode_var = tk.StringVar(value="XY")
+        # 移动到下一行
+        self.corr_btn = tk.Button(param_btn_frame, text="相关性分析", command=self.correlation_analysis, width=12, font=('Microsoft YaHei', 11))
+        self.corr_btn.grid(row=1, column=0, padx=(10, 0), pady=(2, 0), sticky="w")
+        self.corr_mode_cb = ttk.Combobox(param_btn_frame, state='readonly', values=["XY", "全部数值列"], textvariable=self.corr_mode_var, width=10)
+        self.corr_mode_cb.grid(row=1, column=1, padx=(2, 0), pady=(2, 0), sticky="w")
+
         self.predict_btn = tk.Button(param_btn_frame, text="画图/预测", command=self.paint_or_predict, width=16, font=('Microsoft YaHei', 11))
         self.predict_btn.grid(row=0, column=8, padx=(10, 0))
 
+        # --- 展示区（带横纵滚动条）---
         scroll_frame = tk.Frame(main_frame)
         scroll_frame.pack(fill=tk.BOTH, expand=True, pady=(5, 0))
         self.canvas_outer = tk.Canvas(scroll_frame, borderwidth=0, background="#eeeeee", height=600)
-        self.canvas_outer.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.canvas_outer.grid(row=0, column=0, sticky="nsew")
         self.scrollbar = ttk.Scrollbar(scroll_frame, orient="vertical", command=self.canvas_outer.yview)
-        self.scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        self.canvas_outer.configure(yscrollcommand=self.scrollbar.set)
+        self.scrollbar.grid(row=0, column=1, sticky="ns")
+        self.h_scrollbar = ttk.Scrollbar(scroll_frame, orient="horizontal", command=self.canvas_outer.xview)
+        self.h_scrollbar.grid(row=1, column=0, sticky="ew")
+        scroll_frame.grid_rowconfigure(0, weight=1)
+        scroll_frame.grid_columnconfigure(0, weight=1)
+        self.canvas_outer.configure(yscrollcommand=self.scrollbar.set, xscrollcommand=self.h_scrollbar.set)
         self.inner_frame = tk.Frame(self.canvas_outer, background="#eeeeee")
-        self.canvas_outer.create_window((0, 0), window=self.inner_frame, anchor="nw")
+        self.canvas_window = self.canvas_outer.create_window((0, 0), window=self.inner_frame, anchor="nw")
         self.inner_frame.bind("<Configure>", self._on_frame_configure)
         self.canvas_outer.bind_all("<MouseWheel>", self._on_mousewheel)
+        self.canvas_outer.bind_all("<Shift-MouseWheel>", self._on_shift_mousewheel)
+        self.canvas_outer.bind("<Configure>", self._on_canvas_outer_configure)
 
         self.group_figures = {}
         self.group_canvases = {}
@@ -350,11 +369,28 @@ class TimeSeriesPredictorApp:
         self.group_value_filters = {}
         self.all_group_values = {}
 
+        self.corr_result_frame = None  # 用于显示相关性分析结果
+
     def _on_frame_configure(self, event):
         self.canvas_outer.configure(scrollregion=self.canvas_outer.bbox("all"))
+        # 让 inner_frame 宽度不小于 canvas_outer 的可视宽度
+        canvas_width = self.canvas_outer.winfo_width()
+        self.canvas_outer.itemconfig(self.canvas_window, width=canvas_width)
+        # 让所有matplotlib图表宽度自适应
+        for fig in getattr(self, 'group_figures', {}).values():
+            fig.set_size_inches(max(canvas_width/96, 8), fig.get_size_inches()[1])  # 96dpi为1英寸
+        for canvas in getattr(self, 'group_canvases', {}).values():
+            canvas.draw_idle()
+    def _on_canvas_outer_configure(self, event):
+        # 触发inner_frame宽度自适应canvas_outer
+        self.inner_frame.event_generate("<Configure>")
 
     def _on_mousewheel(self, event):
+        # 上下滚动
         self.canvas_outer.yview_scroll(int(-1*(event.delta/120)), "units")
+    def _on_shift_mousewheel(self, event):
+        # 按住 shift 横向滚动
+        self.canvas_outer.xview_scroll(int(-1*(event.delta/120)), "units")
 
     def load_file(self):
         filepath = filedialog.askopenfilename(title="选择CSV文件", filetypes=[("CSV files", "*.csv")])
@@ -673,15 +709,25 @@ class TimeSeriesPredictorApp:
                     if plot_type in ("折线图", "散点图") and meta.get("predictable") and x_type in ("date", "numeric") and y_col:
                         show_formula = True
 
-                    # 生成图表底图
+                    # === 自适应figsize逻辑（进一步放大） ===
+                    base_width = 14
+                    base_height = 8
+                    xlab_len = max([len(str(x)) for x in data[x_col]]) if len(data) > 0 else 4
+                    ylab_len = max([len(str(y)) for y in data[y_col]]) if y_col and len(data) > 0 else 4
+                    n_points = len(data)
+                    group_str_len = len(str(group_key_disp))
+                    width = base_width + min(xlab_len, 40) * 0.18 + min(group_str_len, 40) * 0.13 + min(n_points, 2000) * 0.003
+                    height = base_height + min(ylab_len, 40) * 0.18 + min(n_points, 2000) * 0.003
+                    if plot_type == "饼图" and n_points > 10:
+                        height += (n_points - 10) * 0.12
                     if show_formula:
                         fig, (ax, ax_formula) = plt.subplots(
                             1, 2,
-                            gridspec_kw={'width_ratios': [2.5, 1]},  # 右侧更窄
-                            figsize=(12, 7)  # 更高但不更宽
+                            gridspec_kw={'width_ratios': [4, 1.5]},
+                            figsize=(max(width, 16), max(height, 9))
                         )
                     else:
-                        fig, ax = plt.subplots(figsize=(8, 6))
+                        fig, ax = plt.subplots(figsize=(max(width, 14), max(height, 8)))
                         ax_formula = None
 
                     group_str = f"分组: {group_key_disp}" if group_key_disp else ""
@@ -913,6 +959,198 @@ class TimeSeriesPredictorApp:
             traceback.print_exc(file=sys.stderr)
             messagebox.showerror("出错", f"分析出现异常: {e}\n请查看控制台输出(debug日志)获取详细信息。")
             return
+
+    def correlation_analysis(self):
+        if self.df is None:
+            messagebox.showwarning("警告", "请先加载CSV文件！")
+            return
+        # 清理原有绘图区
+        self.clear_inner_frame()
+
+        mode = self.corr_mode_var.get()
+        # 获取分组字段和分组值
+        group_indices = self.group_lb.curselection()
+        group_cols = [self.group_lb.get(i) for i in group_indices]
+        combos = self.get_selected_group_value_combinations(group_cols)
+        if not combos:
+            combos = [()]  # 无分组时分析全表
+
+        for combo in combos:
+            # 过滤出当前分组数据
+            if not group_cols:
+                df = self.df.copy()
+                group_key_disp = ()
+            else:
+                cond = np.ones(len(self.df), dtype=bool)
+                for i, g in enumerate(group_cols):
+                    cond = cond & (self.df[g] == combo[i])
+                df = self.df[cond].copy()
+                group_key_disp = tuple(combo)
+            if len(df) == 0:
+                continue
+
+            # 选择分析列
+            if mode == "XY":
+                x_col = self.x_cb.get()
+                y_col = self.y_cb.get()
+                # 检查是否为数值型
+                if not x_col or not y_col or x_col == y_col:
+                    tk.Label(self.inner_frame, text="请选择不同的X、Y列！", font=('Microsoft YaHei', 12), fg="red").pack()
+                    return
+                if infer_col_type(df[x_col]) != "numeric" or infer_col_type(df[y_col]) != "numeric":
+                    tk.Label(self.inner_frame, text="X、Y列必须都是数值型，当前选择的列类型不符。", font=('Microsoft YaHei', 12), fg="red").pack()
+                    return
+                cols = [x_col, y_col]
+                df = df[cols].dropna()
+            else:
+                # 全部数值型列
+                num_cols = [c for c in df.columns if infer_col_type(df[c]) == "numeric"]
+                if len(num_cols) < 2:
+                    tk.Label(self.inner_frame, text="数值型列不足2个，无法分析。", font=('Microsoft YaHei', 12), fg="red").pack()
+                    return
+                cols = num_cols
+                df = df[cols].dropna()
+
+            # 分组标题
+            if group_cols:
+                group_str = ", ".join(f"{g}={v}" for g, v in zip(group_cols, combo))
+                tk.Label(self.inner_frame, text=f"分组: {group_str}", font=('Microsoft YaHei', 12, 'bold'), fg="#1a237e").pack(anchor="w", padx=8, pady=(8, 0))
+            else:
+                group_str = ""
+
+            # 相关性分析
+            pearson = df.corr(method="pearson")
+            # 详细统计量表格
+            stat_rows = []
+            for i, col1 in enumerate(cols):
+                for j, col2 in enumerate(cols):
+                    if j <= i:
+                        continue
+                    x = df[col1]
+                    y = df[col2]
+                    # 皮尔逊
+                    r, p = stats.pearsonr(x, y)
+                    # 斯皮尔曼
+                    r_s, p_s = stats.spearmanr(x, y)
+                    # 肯德尔
+                    r_k, p_k = stats.kendalltau(x, y)
+                    # 最小二乘法回归
+                    X = sm.add_constant(x)
+                    model = sm.OLS(y, X).fit()
+                    y_pred = model.predict(X)
+                    resid = y - y_pred
+                    ssr = np.sum((y_pred - np.mean(y))**2)  # 解释平方和
+                    sse = np.sum((y - y_pred)**2)           # 残差平方和
+                    sst = np.sum((y - np.mean(y))**2)       # 总平方和
+                    r2 = model.rsquared
+                    r2_adj = model.rsquared_adj
+                    std_err = model.bse.iloc[1] if len(model.bse) > 1 else float('nan')
+                    t_val = model.tvalues.iloc[1] if len(model.tvalues) > 1 else float('nan')
+                    t_p = model.pvalues.iloc[1] if len(model.pvalues) > 1 else float('nan')
+                    f_val = model.fvalue
+                    f_p = model.f_pvalue
+                    aic = model.aic
+                    bic = model.bic
+                    dw = smtools.durbin_watson(resid)
+                    # 相关性结论
+                    if abs(r) > 0.8:
+                        rel = "强相关"
+                    elif abs(r) > 0.5:
+                        rel = "中等相关"
+                    elif abs(r) > 0.3:
+                        rel = "弱相关"
+                    else:
+                        rel = "几乎无相关"
+                    rel += ", 正相关" if r > 0 else ", 负相关" if r < 0 else ", 无方向"
+                    if p < 0.05:
+                        rel += ", 显著"
+                    else:
+                        rel += ", 不显著"
+                    # DW结论
+                    if dw < 1.5:
+                        dw_str = f"{dw:.2f} (正自相关)"
+                    elif dw > 2.5:
+                        dw_str = f"{dw:.2f} (负自相关)"
+                    else:
+                        dw_str = f"{dw:.2f} (无自相关)"
+                    stat_rows.append([
+                        col1, col2,
+                        f"{r:.3f}", f"{p:.3g}", rel,
+                        f"{r_s:.3f}", f"{p_s:.3g}",
+                        f"{r_k:.3f}", f"{p_k:.3g}",
+                        f"{ssr:.2f}", f"{sse:.2f}", f"{sst:.2f}",
+                        f"{r2:.3f}", f"{r2_adj:.3f}",
+                        f"{std_err:.3g}", f"{t_val:.3g}", f"{t_p:.3g}",
+                        f"{f_val:.3g}", f"{f_p:.3g}",
+                        f"{aic:.2f}", f"{bic:.2f}",
+                        dw_str
+                    ])
+            # 1. 画图+表格在matplotlib图像内
+            columns = [
+                "变量1", "变量2", "皮尔逊r", "P值", "相关性分析",
+                "斯皮尔曼r", "P值", "肯德尔r", "P值",
+                "解释平方和", "残差平方和", "总平方和",
+                "R2", "调整R2", "标准误", "t值", "t P值", "F值", "F P值", "AIC", "BIC", "DW自相关"
+            ]
+            table_data = [columns] + stat_rows
+            nrows = len(table_data)
+            ncols = len(columns)
+            # 图像高度自适应表格行数
+            fig_height = 2.5 + nrows * 0.35
+            fig, ax = plt.subplots(figsize=(min(16, 1.5*ncols), fig_height))
+            ax.axis('off')
+            # 画表格
+            the_table = ax.table(
+                cellText=table_data,
+                colLabels=None,
+                loc='center',
+                cellLoc='center',
+                colWidths=[1.0/ncols]*ncols
+            )
+            the_table.auto_set_font_size(False)
+            the_table.set_fontsize(14)  # 字体更大
+            the_table.scale(1.3, 1.5)  # 更宽松
+            # 画散点图和拟合线（仅XY模式）
+            if mode == "XY" and len(stat_rows) > 0:
+                x = df[cols[0]]
+                y = df[cols[1]]
+                X = sm.add_constant(x)
+                model = sm.OLS(y, X).fit()
+                y_pred = model.predict(X)
+                ax2 = fig.add_axes([0.1, 0.7, 0.8, 0.25])  # [left, bottom, width, height]
+                ax2.scatter(x, y, label="观测值")
+                ax2.plot(x, y_pred, color="red", label="最小二乘拟合")
+                ax2.set_xlabel(cols[0])
+                ax2.set_ylabel(cols[1])
+                ax2.set_title(f"{cols[1]} ~ {cols[0]} 最小二乘法拟合")
+                ax2.legend()
+            # 2. 支持右键复制表格内容
+            from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+            canvas = FigureCanvasTkAgg(fig, master=self.inner_frame)
+            widget = canvas.get_tk_widget()
+            widget.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=8)
+            # 右键菜单
+            def copy_table(event=None, table_data=table_data):
+                text = '\n'.join(['\t'.join(map(str, row)) for row in table_data])
+                self.root.clipboard_clear()
+                self.root.clipboard_append(text)
+            menu = tk.Menu(widget, tearoff=0)
+            menu.add_command(label="复制表格内容", command=copy_table)
+            def show_menu(event):
+                menu.tk_popup(event.x_root, event.y_root)
+            widget.bind("<Button-3>", show_menu)
+            canvas.draw()
+            # 3. 热力图（仅全部数值列且列数>2）
+            if mode != "XY" and len(cols) > 2:
+                fig2, ax2 = plt.subplots(figsize=(min(8, 1+len(cols)), min(6, 1+len(cols))))
+                sns.heatmap(pearson, annot=True, cmap="coolwarm", ax=ax2, fmt=".2f")
+                ax2.set_title("皮尔逊相关性热力图")
+                canvas2 = FigureCanvasTkAgg(fig2, master=self.inner_frame)
+                canvas2.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=8)
+                canvas2.draw()
+        self.inner_frame.update_idletasks()
+        self.canvas_outer.configure(scrollregion=self.canvas_outer.bbox("all"))
+        self.root.update_idletasks()
 
 if __name__ == "__main__":
     root = tk.Tk()
