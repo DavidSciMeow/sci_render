@@ -24,6 +24,11 @@ def infer_col_type(series):
     return "text"
 
 def smart_date_fmt(date_val):
+    # 处理各种类型的日期数据
+    if pd.isnull(date_val):
+        return "NaT"
+    
+    # 如果是pandas Timestamp
     if isinstance(date_val, pd.Timestamp):
         y, m, d = date_val.year, date_val.month, date_val.day
         if (m == 1 and d == 1) or (m == 12 and d == 31):
@@ -32,14 +37,30 @@ def smart_date_fmt(date_val):
             return f"{y}-{m:02d}"
         else:
             return f"{y}-{m:02d}-{d:02d}"
-    elif isinstance(date_val, str):
+    
+    # 如果是numpy datetime64
+    if isinstance(date_val, np.datetime64):
+        try:
+            ts = pd.Timestamp(date_val)
+            return smart_date_fmt(ts)  # 递归调用处理Timestamp
+        except:
+            return str(date_val)
+    
+    # 如果是字符串
+    if isinstance(date_val, str):
         if len(date_val) == 4 and date_val.isdigit():
             return date_val
-        elif date_val.count('-') == 2 and (date_val.split('-')[1] == "01" and date_val.split('-')[2] == "01" or (date_val.split('-')[1] == "12" and date_val.split('-')[2] == "31")):
-            return date_val[:4]
-        else:
-            return date_val
-    else:
+        elif date_val.count('-') == 2:
+            parts = date_val.split('-')
+            if len(parts) == 3 and ((parts[1] == "01" and parts[2] == "01") or (parts[1] == "12" and parts[2] == "31")):
+                return parts[0]
+        return date_val
+    
+    # 尝试转换为pandas Timestamp
+    try:
+        ts = pd.Timestamp(date_val)
+        return smart_date_fmt(ts)
+    except:
         return str(date_val)
 
 def generate_formula_block(formula_type, params):

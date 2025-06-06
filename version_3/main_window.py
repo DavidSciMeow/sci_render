@@ -444,7 +444,8 @@ class TimeSeriesPredictorApp(QMainWindow):
                         cols_needed = [x_col]
                     data = group_data[cols_needed].dropna(subset=[x_col] + ([y_col] if y_col else []))
                     if x_type == "date":
-                        data[x_col] = pd.to_datetime(data[x_col], errors='coerce')
+                        # 使用改进的日期解析函数处理各种日期格式，包括纯年份
+                        data[x_col] = data[x_col].apply(self.try_parse_date)
                         data = data.dropna(subset=[x_col])
                         data = data.sort_values(by=x_col)
                     elif x_type == "numeric":
@@ -483,21 +484,15 @@ class TimeSeriesPredictorApp(QMainWindow):
                         fig, ax = plt.subplots(figsize=(max(width, 14), max(height, 8)))
                         ax_formula = None
 
-                    group_str = f"分组: {group_key_disp}" if group_key_disp else ""
-
-                    # 主图
+                    group_str = ""                    # 主图
                     if plot_type == "折线图":
                         if x_type == "date":
-                            x_vals = data[x_col].apply(self.try_parse_date)
-                            x_vals_fmt = x_vals.apply(smart_date_fmt)
-                            ax.plot(x_vals_fmt, data[y_col], marker="o", label="历史")
+                            ax.plot(data[x_col], data[y_col], marker="o", label="历史")
                         else:
                             ax.plot(data[x_col], data[y_col], marker="o", label="历史")
                     elif plot_type == "散点图":
                         if x_type == "date":
-                            x_vals = data[x_col].apply(self.try_parse_date)
-                            x_vals_fmt = x_vals.apply(smart_date_fmt)
-                            ax.scatter(x_vals_fmt, data[y_col], marker="o", label="历史")
+                            ax.scatter(data[x_col], data[y_col], marker="o", label="历史")
                         else:
                             ax.scatter(data[x_col], data[y_col], marker="o", label="历史")
                     elif plot_type == "条形图":
@@ -547,7 +542,7 @@ class TimeSeriesPredictorApp(QMainWindow):
                                 else:
                                     s_vals = [0] * show_n
                                 eps_vals = (forecast['yhat'][-show_n:] - forecast['trend'][-show_n:] - (forecast['seasonal'][-show_n:] if 'seasonal' in forecast.columns else 0)).round(3).tolist()
-                                ds_vals = forecast['ds'][-show_n:].dt.strftime('%Y-%m-%d').tolist()
+                                ds_vals = [smart_date_fmt(x) for x in forecast['ds'][-show_n:]]
                                 formula_type = "Prophet"
                                 formula_params = {
                                     'trend_type': trend_type,
@@ -583,7 +578,7 @@ class TimeSeriesPredictorApp(QMainWindow):
                                     'b': lr.intercept_,
                                     'mse': mse,
                                     'x_label': x_col,
-                                    'x_vals': list(data[x_col]),
+                                    'x_vals': list(history_x) if x_type == "date" else list(data[x_col]),
                                     'y_true': y,
                                     'y_pred': lr.predict(X),
                                     'resid': resid
@@ -606,7 +601,7 @@ class TimeSeriesPredictorApp(QMainWindow):
                                     'last': last_val,
                                     'mse': mse,
                                     'x_label': x_col,
-                                    'x_vals': list(data[x_col]),
+                                    'x_vals': list(history_x) if x_type == "date" else list(data[x_col]),
                                     'y_true': history_y,
                                     'y_pred': [last_val]*len(history_y),
                                     'resid': resid
@@ -650,7 +645,7 @@ class TimeSeriesPredictorApp(QMainWindow):
                                     'coefs': coefs,
                                     'mse': mse,
                                     'x_label': x_col,
-                                    'x_vals': list(data[x_col]),
+                                    'x_vals': list(history_x) if x_type == "date" else list(data[x_col]),
                                     'y_true': y,
                                     'y_pred': poly(X),
                                     'resid': resid
@@ -771,6 +766,9 @@ class TimeSeriesPredictorApp(QMainWindow):
                     df = df[cols].dropna()
                 if group_cols:
                     group_str = ", ".join(f"{g}={v}" for g, v in zip(group_cols, combo))
+                    label = QLabel(f"分组: {group_str}")
+                    label.setStyleSheet("color: #1a237e; font-weight: bold; font-size: 14px;")
+                    self.inner_layout.addWidget(label)
                 pearson = df.corr(method="pearson")
                 stat_rows = []
                 for i, col1 in enumerate(cols):
@@ -857,12 +855,13 @@ class TimeSeriesPredictorApp(QMainWindow):
                     ax_main.set_ylabel(cols[1])
                     # 主标题
                     main_title = f"{cols[1]} ~ {cols[0]} 最小二乘法拟合"
+                    # 分组副标题
                     if group_cols:
                         group_str = ", ".join(f"{g}={v}" for g, v in zip(group_cols, combo))
-                        ax_main.set_title(main_title, fontsize=15, pad=20, loc='center')
-                        ax_main.text(0.5, 1.2, f"分组: {group_str}", fontsize=12, color="#444", ha='center', va='bottom', transform=ax_main.transAxes)
+                        ax_main.set_title(main_title, fontsize=15, pad=16, loc='center')
+                        ax_main.text(0.5, 1.3, f"分组: {group_str}", fontsize=12, color="#444", ha='center', va='bottom', transform=ax_main.transAxes)
                     else:
-                        ax_main.set_title(main_title, fontsize=15, pad=20, loc='center')
+                        ax_main.set_title(main_title, fontsize=15, pad=16, loc='center')
                     ax_main.legend()
                     # 表格区嵌套GridSpec
                     gs_tables = gridspec.GridSpecFromSubplotSpec(4, 1, subplot_spec=gs_main[1], height_ratios=[1,1,1,1], hspace=table_gap/table_height)
@@ -1009,15 +1008,28 @@ class TimeSeriesPredictorApp(QMainWindow):
         import pandas as pd
         if pd.isnull(s):
             return pd.NaT
-        str_s = str(s)
+        str_s = str(s).strip()
         try:
+            # 处理中文年月格式
             if "年" in str_s and "月" in str_s:
                 return pd.to_datetime(str_s, format='%Y年%m月')
             elif "年" in str_s:
                 return pd.to_datetime(str_s, format='%Y年')
+            # 处理纯年份（如2000, 2010, 2004）
+            elif str_s.isdigit() and len(str_s) == 4:
+                year = int(str_s)
+                return pd.Timestamp(year=year, month=1, day=1)
+            # 处理带分隔符的日期
             elif "-" in str_s or "/" in str_s:
                 return pd.to_datetime(str_s)
             else:
+                # 尝试作为年份处理
+                try:
+                    year = int(float(str_s))  # 处理可能的浮点数格式
+                    if 1900 <= year <= 2100:  # 合理的年份范围
+                        return pd.Timestamp(year=year, month=1, day=1)
+                except:
+                    pass
                 return pd.to_datetime(str_s, format='%Y')
         except Exception:
             return pd.to_datetime(str_s, errors='coerce')
